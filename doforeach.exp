@@ -1,0 +1,1198 @@
+#!/bin/env expect
+#####!/usr/bin/expect
+
+set facility "doforeach"
+set version "2.027"
+###################
+# Login/run multiple commands across a list of systems
+# (Functionality is superseded by Parallel-SSH)
+#
+# This is the core component of my Host Survey Toolkit,
+# first devised in 2010 to run commands on, pull infor-
+# mation from and produce reports for lists of systems.
+#
+# Once upon a time, it worked around sudo's inability to
+# run without a terminal.
+#
+# You may use it to directly login to the hosts, or you
+# may specify an intermediate ("jump") host to login to
+# first to ssh -A into the listed hosts.
+#
+# Adjust the timeout values to ensure your logins to your
+# slowest hosts are successfully detected.
+#
+# Script contains many tweaks to overcome one-off issues
+# with recognizing successful logins on eccentric hosts.
+# You may have to tweak it further for your site.
+#
+# author: t. golden
+# version 2.0, jun 2010
+#
+###
+# NOTES:
+# - You are assumed to have set up your SSH key/passphrase
+# via ssh-add prior to running this script.
+#
+# - The command or commands are passed verbatim to each host
+# without globbing or substitution and are executed on
+# each host as if you typed it directly
+#
+# $spawn_id is special but NOT global when I tested it.  If
+# undefined, the most recent spawn is assumed for expect/send
+# statements
+#
+# Modification History:
+# Aug 2010 tgolden
+# - 2.000 Initial version
+# Sep 2010-2018 tgolden
+# - 2.004-2.027 Many tweaks
+####################
+
+##########
+# HELP -? or -h or --help
+##########
+set tmp [ lindex $argv 0 ]
+
+if { ( $tmp == "-h" ) || ( $tmp == "-?" ) || ( $tmp == "--help" ) } {
+
+    puts stderr "$facility - version $version"
+    puts stderr " "
+    puts stderr "Usage: "
+    puts stderr "    $argv0 "
+    puts stderr "        \[ -u \{loginID\} ]"
+    puts stderr "        \[ -c \{commandsFn\} ]"
+    puts stderr "        \[ -l \{hostListFn\} ]"
+    puts stderr "        \[ -st \{connectTimeoutSecs\} ]"
+    puts stderr "        \[ -t \{cmdTimeoutSecs\} ]"
+    puts stderr "        \[ -i \{interrmediateHost\} \[ -iu \{intUser\} ] | -r ]"
+    puts stderr "        \[ -p ] | \[ -pp ]"
+    puts stderr "        \[ -d | -dd | -ddd ]"
+    puts stderr "        \[ -v | -vv | -vvv ]"
+    puts stderr " "
+    puts stderr "where:"
+    puts stderr "\[-u]  login ID to use, must match ssh key loaded via ssh-add"
+    puts stderr "\[-c]  name of local file containing list of commands to transmit"
+    puts stderr "      literally and execute on each host"
+    puts stderr "      (if not present, script prompts for one command to execute)"
+    puts stderr "\[-l]  name of local file containing list of hosts to login to)"
+    puts stderr "      (if not present, script prompts for name of host list file"
+    puts stderr "\[-st] number of seconds to wait to see the first prompt when logging "
+    puts stderr "      into a host"
+    puts stderr "\[-t]  number of seconds to wait for each command to execute on host"
+    puts stderr "\[-i]  connect to intermediate trusted host, then login to each target"
+    puts stderr "      host as root using the root@trusted_host key"
+    puts stderr "\[-iu] if -i, connect to intermediate  host as specified user"
+    puts stderr "\[-r]  connect to remote host as root, assuming your ssh key is in "
+    puts stderr "      root\'s authorized keys file."
+    puts stderr "\[-p]  prompt for a regex which will uniquely match your usual login "
+    puts stderr "      prompt.  If the script can recognize your usual prompt, it will"
+    puts stderr "      not need to waste time timing out waiting for each system to "
+    puts stderr "      present a login prompt"
+    puts stderr "\[-pp] check for existence of envar MY_PROMPT_REGEXP and use its value"
+    puts stderr "      and use that instead of prompting as in -p above"
+    puts stderr "\[-v/vv/vvv] increase verbosity level"
+    puts stderr "\[-d/dd/ddd] increase debugging message level"
+    puts stderr " "
+    puts stderr "'-c' file may contain the following DoForEach pseudo-commands:"
+    puts stderr "     dfepush localfilename remotefilename"
+    puts stderr "Example: -c dfecmdlist.txt"
+    puts stderr "     dfepush myscript.sh ./tempscript.sh"
+    puts stderr "     bash ./tempscript.sh"
+    puts stderr "     rm ./tempscript.sh"
+    exit 1
+}
+
+##########
+# INITIALIZATION
+##########
+
+set prompt_inthost "::::INTHOST::::"
+set prompt_remhost "::::EXPECT::::"
+
+
+# Tweak these regexes to reduce false login failures on eccentric hosts.
+
+#set prompt_passwd_re "^\[Pp]assword:[ ]\{0,1}|\r\n\[Pp]assword:"
+set prompt_passwd_re "^\[Pp]assword:[ ]\{0,1}|\r\n\[Pp]assword:|\r\n\Response:[ ]\{0,1}|\r\n.sudo. password for .*: "
+set prompt_passwd2_re ".*s password:\[ ]\{0,1}"
+set prompt_sshsure_re "Are you sure you want to continue connecting (yes/no)?"
+
+set msg_closed_re "Connection to .* closed.|Connection closed by foreign host|Connection closed by remote host.|Received disconnect from.*|Connection closed by ."
+set msg_closed_retval 32767
+set msg_denied_re "Permission denied\.|Permission denied \(.*\)|Access denied\.|Your account has been locked"
+set msg_denied_retval 32766
+set msg_denied_tryagain_re "Permission denied,.*"
+set msg_sshpuke_re "lost connection|Local: Bad packet length|key_verify failed for server_host_key|Local: Corrupted check bytes on input"
+set msg_sshpuke_retval 32765
+
+
+# Internal return values
+
+set ok_retval 0
+set eof_retval 32763
+set timeout_retval 32762
+set likelystalled_retval 32761
+set wronghost_retval 32760
+set never_retval 32759
+
+
+# Set initial values
+
+set myid ""
+set intid "NOLOGIN"
+set mypw ""
+set hostfn ""
+set hosts ""
+set commandfn ""
+set commands ""
+set inthost ""
+set tmo 15
+set start_tmo 3
+set echo_tmo 10
+set inthost_spawnpid ""
+set host_spawnpid ""
+set debuglevel 0
+set verboselevel 0
+
+
+# option to specify your own initial prompt regex to speed things up
+# otherwise I must timeout before I can set my own prompt
+# cannot allow prompt_myprompt_re to be "" otherwise it will match everything
+
+set default_myprompt_re "#%11MaTcHEsNoThInG11%#"
+set prompt_myprompt_re $default_myprompt_re
+#site-specific
+set prompt_myprompt_re [ format {^.*%s[#$] } $myid ]
+set ask_for_myprompt "no"
+set check_for_myprompt_regex "no"
+
+set dfepush_maxlines 500
+
+set rtitle ""
+set mypwdset "NO"
+
+
+##########
+# FUNCTIONS
+##########
+
+###
+# setexpdebug - Set Expect debug
+###
+proc setexpdebug { sd_toggle } {
+    if { $sd_toggle == "off" } { exp_internal 0 }
+    if { $sd_toggle == "on" } { exp_internal 1 }
+}
+
+
+###
+# printable - remove/substitute non-printable characters
+#  which might interfere with parsing of output
+###
+
+proc printable { pp_string } {
+
+    regsub -all "\r" $pp_string "\[\[CR\]\]" pp_tmp
+    regsub -all "\n" $pp_tmp "\[\[NL\]\]" pp_tmp
+    regsub -all "\v" $pp_tmp "\[\[VT\]\]" pp_tmp
+    return $pp_tmp
+}
+
+
+###
+# debugme - messages that are displayed for debugging only
+###
+
+proc debugme { dm_level dm_msg } {
+    global debuglevel
+
+    if { $dm_level <= $debuglevel } {
+        puts "\n     %%% ($dm_level) $dm_msg %%%\n"
+    }
+
+}
+
+
+###
+# verboseme - messages that are selectively displayed
+###
+
+proc verboseme { vm_level vm_msg } {
+    global verboselevel
+
+    if { $vm_level <= $verboselevel } {
+        puts "\n     ### ($vm_level) $vm_msg ###\n"
+    }
+
+}
+
+
+###
+# informme - messages that are always displayed
+###
+proc informme { im_type im_msg } {
+
+    switch $im_type {
+        banner1 {
+            puts "\n##########"
+            puts "# $im_msg"
+            puts "##########"
+        }
+        banner1begin {
+            puts "\n##########"
+            puts "# $im_msg"
+        }
+        banner1end {
+            puts "\n# $im_msg"
+            puts "##########"
+        }
+        banner2 {
+            puts "\n     #####"
+            puts "     # $im_msg"
+            puts "     #####"
+        }
+        banner2begin {
+            puts "\n     #####"
+            puts "     # $im_msg"
+        }
+        banner2end {
+            puts "\n     # $im_msg"
+            puts "     #####"
+        }
+        banner3 {
+            puts "\n          #####"
+            puts "          # $im_msg"
+            puts "          #####"
+        }	
+        info    { puts "\nFYI: $im_msg" }
+        warn    { puts "\nWARNING: $im_msg" }
+        error   { puts "\nERROR: $im_msg" }
+        line    { puts "\n$im_msg" }
+        *       { puts "\n???: $im_msg" }
+    }
+}
+
+
+###
+# askme - Ask for input
+###
+
+proc askme { am_prompt am_echo } {
+        if { $am_echo == "noecho" } { set am_oldmode [stty -echo -raw] }
+
+    send_user "[ format "%40s : " $am_prompt ]"
+        set timeout -1
+        expect_user -re "(.*)\n"
+        if { $am_echo == "noecho" } { send_user "\n" ; eval stty $am_oldmode }
+        return $expect_out(1,string)
+}
+
+
+###
+# send_start_session - start session on remote host
+###
+
+proc send_start_session { sp_prompt sp_wronghostprompt sp_tmo sp_pwd }  {
+    global prompt_passwd_re
+    global prompt_passwd2_re
+    global prompt_sshsure_re
+    global msg_closed_re
+    global msg_closed_retval
+    global msg_denied_re
+    global msg_denied_retval
+    global msg_denied_tryagain_re
+    global msg_sshpuke_re
+    global msg_sshpuke_retval
+    global ok_retval
+    global eof_retval
+    global wronghost_retval
+    global timeout_retval
+    global likelystalled_retval
+    global prompt_myprompt_re
+
+
+## doing my own timeout count for better granularity
+
+    set timeout 1
+    set sp_waited 0
+
+    verboseme 1 "send_start_session called, waiting for initial prompt"
+    expect {
+
+## First, test for failure
+
+        -re ${msg_closed_re} {
+            debugme 3 "Closed, returning"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            return $msg_closed_retval }
+        -re ${msg_denied_re} {
+            debugme 3 "Permission denied, returning"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            return $msg_denied_retval }
+        -re ${msg_sshpuke_re} {
+            debugme 3 "SSH puked, returning"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            return $msg_sshpuke_retval }
+
+## Or respond to SSH conversation and loop
+
+               -re ${prompt_sshsure_re} {
+            send "yes\r"
+            debugme 2 "Yes we want to connect, looping"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            exp_continue }
+
+## Or, send password and loop
+## If we get a passwd prompt, then we want to stop sending
+## \r's if we subsedquently timeout - otherwise it may cause
+## the password to appear in plaintext
+
+        -re ${prompt_passwd_re}$ {
+            send "$sp_pwd\r"
+            set sp_waited 0
+            debugme 3 "Caught standard passwd prompt with re '$' appended"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            debugme 2 "Sending password, looping"
+            exp_continue }
+        -re ${prompt_passwd_re} {
+            send "$sp_pwd\r"
+            set sp_waited 0
+            debugme 3 "Caught standard passwd prompt without re '$' appended"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            debugme 2 "Sending password, looping"
+            exp_continue }
+        -re ${prompt_passwd2_re}$ {
+            send "$sp_pwd\r"
+            set sp_waited 0
+            debugme 3 "Got match for //${prompt_passwd2_re}$// with appended $ at end"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            debugme 2 "Sending password, looping"
+            exp_continue }
+        -re ${prompt_passwd2_re} {
+            send "$sp_pwd\r"
+            set sp_waited 0
+            debugme 3 "Got match for //${prompt_passwd2_re}// <- without $ at end"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            debugme 2 "Sending password, looping"
+            exp_continue }
+
+
+## Or, if we hear that the password is bad, speed up the disconnect process
+
+        -re ${msg_denied_tryagain_re} {
+            send "\r"
+            set sp_waited 0
+            debugme 2 "Does not like the password, sending CR and looping"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            exp_continue }
+
+
+## Or just cr/nl's
+
+        -re "^\[\r\n\]+$|^\[\r\n\]+" {
+            incr sp_waited
+            debugme 1 "$sp_waited second(s) elapsed, seeing nothing but CR/NL's, looping"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            if { $sp_waited < $sp_tmo } {
+                exp_continue
+            } else {
+
+## If all we're seeing is CR's/NL's then we're effectively timing out
+
+                debugme 1 "Timed out, we are likely stalled, returning"
+                return $likelystalled_retval
+            } }
+
+## Or we are seeing what we hope to see and can fall through
+# If we see my usual command prompt, that means we are in
+
+        -re $prompt_myprompt_re {
+            debugme 2 "I recognize that prompt, falling through"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            }
+
+# If we called send_start_session on already-open connection to inthost
+
+        -re $sp_prompt {
+            verboseme 1 "Caught already-set expected prompt \"${sp_prompt}\", returning OK"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            return 0
+            }
+
+        -re ${sp_wronghostprompt} {
+            if { [ llength $sp_wronghostprompt ] > 0 } {
+                debugme 1 "Caught wrong prompt \"$sp_wronghostprompt\", returning"
+                debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+                debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+                    return $wronghost_retval }
+            } else {
+                exp_continue
+            }
+
+## Or we hit EOF / (our own) timeout
+
+        eof {
+            debugme 3 "Caught EOF signal, returning"
+            return $eof_retval }
+        timeout {
+            incr sp_waited
+            if { $sp_waited < $sp_tmo } {
+                debugme 2 "$sp_waited second(s) elapsed without expected prompt or message, looping"
+                exp_continue
+            } else {
+
+# moving on, either checking for wrong prompt or forcing prompt
+
+                debugme 2 "Timer exceeded $sp_tmo second(s), continuing"
+            }
+        }
+    }
+
+## If sp_wronghostprompt is non-null then also carry out this test:
+# if we are talking to the intermediate host when we should
+# be talking to the target host, we should *not* go ahead
+# and change the prompt, but rather check for the intermediate
+# host prompt and fail if we see it or if the host is non-responsive
+
+    set timeout 1
+    set sp_stalled 0
+    if { [ llength $sp_wronghostprompt ] > 0 } {
+        verboseme 1 "Are we talking to correct host? \"$sp_wronghostprompt\"=NO"
+        send "\r"
+        expect *
+        send "\r"
+        expect {
+            -re $sp_wronghostprompt {
+                debugme 1 "Caught wrong prompt \"$sp_wronghostprompt\", returning"
+                debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+                debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+                return $wronghost_retval }
+            -re "^\[\r\n\]+$|^\[\r\n\]+" {
+                debugme 1 "$sp_waited second(s) elapsed again with nothing but CR/NL's, looping"
+                debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+                debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+                incr sp_stalled 1
+                if { $sp_stalled < $sp_tmo } {
+                    sleep 1
+                    exp_continue
+                } else {
+                    debugme 1 "Timer exceeded $sp_tmo secs.  We are likely stalled, returning"
+                    debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+                    debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+                    return $likelystalled_retval
+                } }
+            -re .+$ {
+                debugme 1 "Caught any string other than wrong prompt, falling through"
+                debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+                debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+                }
+            timeout {
+                debugme 1 "Timed out, we are likely stalled, returning"
+                return $likelystalled_retval
+            }
+
+        }
+    }
+
+## Set prompt on target host
+
+    verboseme 1 "Forcing expected command prompt \"${sp_prompt}\""
+
+    send "set prompt=\"$sp_prompt\" \r"
+    send "PROMPT_COMMAND= \r"
+    send "PS1=\"$sp_prompt\" \r"
+
+# Doing my own timeout count for better granularity
+
+    set timeout 1
+    set sp_waited 0
+
+    expect {
+
+## Once again, test for failures first
+
+        -re ${msg_denied_re} {
+            debugme 3 "Permission denied, returning"
+            return $msg_denied_retval }
+
+## Then anything that needs to loop
+
+        -re ${prompt_sshsure_re} {
+            send "yes\r"
+            debugme 2 "Yes we want to connect, looping"
+            set sp_waited 0
+            exp_continue }
+        -re ${prompt_passwd_re}$ {
+            send "$sp_pwd\r"
+            debugme 3 "Caught standard passwd prompt with re '$' appended"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            debugme 2 "Sending password, looping"
+            set sp_waited 0
+            exp_continue }
+        -re ${prompt_passwd_re} {
+            send "$sp_pwd\r"
+            debugme 3 "Caught standard passwd prompt without re '$' appended"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            debugme 2 "Sending password, looping"
+            set sp_waited 0
+            exp_continue }
+        -re ${prompt_passwd2_re}$ {
+            send "$sp_pwd\r"
+            debugme 3 "Got match for //${prompt_passwd2_re}$// with appended $ at end"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            debugme 2 "Sending password, looping"
+            set sp_waited 0
+            exp_continue }
+
+## Or just cr/nl's
+
+        -re "^\[\r\n\]+$|^\[\r\n\]+" {
+            debugme 1 "$sp_waited second(s) elapsed yet again with nothing but CR/NL's, looping"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            incr sp_waited
+            debugme 2 "$sp_waited second(s) elapsed"
+            if { $sp_waited < $sp_tmo } {
+                exp_continue
+            } else {
+
+## If all we're seeing is CR's/NL's then we're effectively timing out
+
+                debugme 1 "Timed out, we are likely stalled, returning"
+                return $likelystalled_retval
+            } }
+
+## Then successes
+
+        -re ${sp_prompt}$ {
+            verboseme 1 "Set/got expected prompt \"${sp_prompt}\", returning OK"
+            return $ok_retval }
+        -re ${prompt_passwd2_re} {
+            debugme 3 "Got match for //${prompt_passwd2_re}$// without appended $ at end"
+            debugme 3 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 3 "     0=///[ printable $expect_out(0,string) ]///"
+            debugme 2 "Sending password, looping"
+            set sp_waited 0
+            send "$sp_pwd\r"
+            exp_continue }
+
+## Then eof / timeout
+
+        eof {
+            debugme 3 "Caught EOF signal, returning"
+            return $eof_retval }
+        timeout {
+            verboseme 2 "$sp_waited second(s) elapsed without seeing expected prompt"
+            incr sp_waited
+            if { $sp_waited < $sp_tmo } {
+                exp_continue
+            } else {
+                verboseme 2 "Timer exceeded $sp_tmo second(s), returning"
+                return $timeout_retval
+            } }
+    }
+}
+
+
+###
+# send_cmd - Send a command to the remote host
+###
+proc send_cmd { sc_prompt sc_tmo sc_pwd sc_cmd } {
+    global prompt_passwd_re
+    global ok_retval
+    global eof_retval
+    global timeout_retval
+    global never_retval
+
+# set my own timeout for improved granularity
+
+    set timeout 1
+    set sc_waited 0
+
+    debugme 1 "send_cmd called"
+
+    if { $sc_cmd != "" } {
+
+        debugme 2 "send_cmd sending command"
+
+        sleep 1
+        send "$sc_cmd"
+        sleep 1
+        send "\r"
+        sleep 1
+
+        debugme 2 "send_cmd command sent"
+    }
+
+    debugme 3 "send_cmd expecting"
+    expect {
+
+## Success
+
+        -re "(${prompt_passwd_re})$" {
+            debugme 2 "send_cmd caught standard passwd prompt with '$' at end, looping"
+            debugme 2 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 2 "     0=///[ printable $expect_out(0,string) ]///"
+            send "$sc_pwd\r"
+            set sc_waited 0
+            exp_continue }
+        -re "${prompt_passwd_re}" {
+            debugme 2 "send_cmd caught standard passwd prompt without re '$' at end"
+            debugme 2 "Buffer=///[ printable $expect_out(buffer) ]///"
+            debugme 2 "     0=///[ printable $expect_out(0,string) ]///"
+            send "$sc_pwd\r"
+            set sc_waited 0
+            exp_continue }
+
+        -re "^${sc_prompt}$|.*\r\n${sc_prompt}$" {
+            debugme 2 "send_cmd got expected prompt with re '$' at end, returning"
+            return $ok_retval }
+
+## EOF / timeout
+
+        timeout {
+            send "\r"
+            verboseme 2 "send_cmd $sc_waited second(s) elapsed since cmd sent, waiting for prompt"
+            incr sc_waited
+            if { $sc_waited < $sc_tmo } {
+                exp_continue
+            } else {
+                debugme 2 "send_cmd timer exceeded $sc_tmo second(s), returning"
+                return $timeout_retval
+            }
+        eof {
+            debugme 2 "send_cmd caught eof, returning"
+            return $eof_retval }
+        }
+    }
+    debugme 3 "send_cmd fell through, should never get here, returning"
+    return $never_retval
+}
+
+
+###
+# dfepush - DoForEach push file to remote host for execution
+#
+# Transmit a file to the target system in so that it can be
+# executed remotely.  This is the workaround enabling
+# a call to a shell within doforeach, e.g:
+#    dfepush myscript ./tempscript
+#    bash ./tempscript
+#    rm ./tempscript
+# Main difference between dfepush and send_cmd is that
+# dfepush doesn't look for the expected prompt until
+# after the file has been transmitted.  [If you remember
+# the 'Reflection' terminal emulator, this is similar to
+# how it went about pushing its remote file transfer client
+# program program over the terminal session]
+###
+
+proc dfepush { sf_prompt sf_tmo sf_localfn sf_remfn } {
+    global prompt_passwd_re
+    global ok_retval
+    global eof_retval
+    global timeout_retval
+    global dfepush_maxlines
+
+    set timeout $sf_tmo
+
+    if { $sf_remfn == "" } {
+        informme error "no remote dfepush filename, exiting\n"
+        exp_exit 1
+    }
+
+    informme banner3begin "DFEPUSH $sf_localfn to $sf_remfn"
+
+    # eval sf_localfn to expand env vars
+    eval set sf_realfn $sf_localfn
+
+    if [ catch { open $sf_realfn r } sf_file ] {
+       informme error "opening $sf_localfn $sf_realfn, exiting\n"
+       exp_exit 1
+    }
+
+    debugme 2 "Sending file"
+    send "sed 'a\\' >${sf_remfn} \r"
+    sleep 1
+
+    set sf_count 0
+    while 1 {
+        if { [ gets $sf_file localln ] == -1 } { break }
+        if { $sf_count == $dfepush_maxlines } { sleep 1 ; set sf_count 0 } else { incr sf_count }
+        send "$localln\r"
+        expect {
+            -re "\r\n" {
+                debugme 2 "   $localln"
+            }
+            -re ".*No space left on device" {
+
+# todo - turn this into a prompt/retval combo
+
+                debugme 2 "System says doesn't have enough space"
+                return $eof_retval }
+            -re ".*No space left on device" {
+
+# todo - turn this into a prompt/retval combo
+
+                debugme 2 "System says doesn't have enough space"
+                return $eof_retval }
+            -re "^${sf_prompt}$|.*\r\n${sf_prompt}$" {
+                debugme 2 "dfepush got regular prompt while pushing file, should never happen here, returning"
+                return $eof_retval }
+            timeout {
+                debugme 2 "Timer caught timeout while transmitting file, returning"
+                return $timeout_retval }
+            eof {
+                debugme 2 "dfepush caught eof while transmitting file, returning"
+                return $eof_retval }
+        }
+    }
+
+    sleep 1
+    send "\004"
+    debugme 2 "   EOF"
+
+    informme banner3end "DFEPUSH $sf_localfn $sf_realfn to $sf_remfn"
+
+    close $sf_file
+
+    sleep 1
+    send "\r"
+    expect {
+
+## Success
+
+        -re "^${sf_prompt}$|.*\r\n${sf_prompt}$" {
+            debugme 2 "dfepush got expected prompt with re '$' at end, returning"
+            return $ok_retval }
+
+## EOF / timeout
+
+        timeout {
+            debugme 2 "Timer caught timeout, returning"
+            return $timeout_retval }
+        eof {
+            debugme 2 "dfepush caught eof, returning"
+            return $eof_retval }
+    }
+}
+
+
+###
+# send_end_session - Close remote session
+###
+
+proc send_end_session { se_prompt se_tmo } {
+    global msg_closed_re
+    global msg_closed_retval
+    global msg_denied_re
+    global msg_denied_retval
+    global msg_denied_tryagain_re
+    global eof_retval
+    global timeout_retval
+    global spawn_id
+
+    debugme 1 "send_end_session $spawn_id called"
+
+    set timeout $se_tmo
+    send "exit\r"
+
+    expect {
+        -re ${se_prompt}$ {
+
+# Expected command prompt
+
+            debugme 2 "send_end_session caught expected prompt, sending 'exit' and looping"
+            send "exit\r"
+            exp_continue }
+
+# If we get Permission Denied, we speed up the disconnect process
+
+        -re ${msg_denied_tryagain_re} {
+            debugme 2 "send_end_session caught Permission Denied, looping"
+
+#   Do not send a '\r' here, it may cause the next passwd prompt
+#   to fail and we'll end up with the sent password becoming visible
+
+            exp_continue }
+
+# or we should signal failure
+
+        -re ${msg_closed_re} {
+            debugme 3 "send_end_session caught Closed, returning"
+            return $msg_closed_retval }
+        -re ${msg_denied_re} {
+            debugme 3 "send_end_session caught Permission denied, returning"
+            return $msg_denied_retval }
+
+# timeout should not be the way we leave
+
+        timeout {
+            debugme 2 "Timed out, looping"
+            send "exit\r"
+            exp_continue
+            return $eof_timeout }
+
+# eof should be the way we leave
+
+        eof {
+            debugme 3 "Caught EOF signal, returning"
+            return $eof_retval }
+    }
+}
+
+
+
+####################
+# MAINLINE
+####################
+
+#####
+# 1. Process commannd line arguments
+#####
+
+    set argc [ llength $argv ]
+    for { set i 0 }  { $i < $argc } { incr i } {
+
+# switch '--' is needed because each argv may contain leading dashes
+
+        switch -- [ lindex $argv $i ] {
+            -u 	{ incr i ; set myid [ lindex $argv $i ] }
+            -c 	{ incr i ; set commandfn [ lindex $argv $i ] }
+            -i 	{ incr i ; set inthost [ lindex $argv $i ] }
+            -iu 	{ incr i ; set intid [ lindex $argv $i ] }
+            -l 	{ incr i ; set hostfn [ lindex $argv $i ] }
+            -r	{ set myid "root" ; set inthost "" }
+            -t	{ incr i ; set tmo [ lindex $argv $i ] }
+            -st	{ incr i ; set start_tmo [ lindex $argv $i ] }
+            -p	{ set ask_for_myprompt "yes" }
+            -pp	{ set ask_for_myprompt "yes" ; set check_for_myprompt_regexp "yes" }
+            -ddd	{ set debuglevel 3 }
+            -dd	{ set debuglevel 2 }
+            -d	{ incr debuglevel }
+            -vvv	{ set verboselevel 3 }
+            -vv	{ set verboselevel 2 }
+            -v	{ incr verboselevel }
+            -ti	{ incr i ; set rtitle [ lindex $argv $i ] }
+            -pw	{ incr i ; set mypw [ lindex $argv $i ] ; set mypwdset "YES" }
+        }
+    }
+
+### pick up pw from envar and delete envar
+
+    if { [ info exists ::env(DFESPW) ] } {
+        if { $::env(DFESPW) != "" } {
+            set mypw $::env(DFESPW)
+            set mypwdset "YES"
+            set ::env(DFESPW) " "
+            debugme 4 "PW $mypw $::env(DFESPW)"
+        }
+    }
+
+
+
+###
+# 2. Fill in the argument blanks
+###
+
+    debugme 1 "Debug level set to $debuglevel"
+    verboseme 1 "Verbosity level set to $verboselevel"
+    informme banner1 "BEGIN $facility $version $rtitle"
+
+### yuck - immediately report that command or host file doesn't
+###  exist if specified on command line
+
+    if { $hostfn != "" } {
+        if [ catch { open $hostfn r } hostfile ] {
+       			informme error "$hostfile, exiting"
+       			exp_exit 1
+        }
+    }
+
+    if { $commandfn != "" } {
+        if [ catch { open $commandfn r } commandfile ] {
+       			informme error "$commandfile, exiting"
+       			exp_exit 1
+        }
+    }
+
+### login id
+
+    if { $myid == "" } { set myid [ askme "Login id" echo ] }
+
+### passwd
+
+    while { $mypwdset == "NO" } {
+        set mypw [ askme "Enter your SUDO password" noecho ]
+        if { $mypw == "" } {
+            exp_exit 1	
+        } else {
+            set mypw2 [ askme "Re-enter your SUDO pwd  " noecho ]
+            if { $mypw != $mypw2 } {
+                informme error "Password entries do not match, try again"
+            } else {
+                set mypwdset "YES"
+            }
+        }
+    }
+
+### host list file
+
+    if { $hostfn == "" } {
+        set hostfn [ askme "Host list filename" echo ]
+        if [ catch { open $hostfn r } hostfile ] {
+       			informme error "$hostfile, exiting\n"
+       			exp_exit 1
+        }
+    }
+
+    while 1 {
+        if { [ gets $hostfile ln ] == -1 } { break }
+        lappend hosts "$ln"
+    }
+
+    close $hostfile
+
+    if { [ lindex $hosts ] < 0 }  {
+       		informme error "No hosts in $hostfn, exiting\n"
+       		exp_exit 1
+    }
+
+### command or script file
+
+    if { $commandfn == "" } {
+        set tmp [ askme "Command" echo ]
+        if { [ llength $tmp ] == 0 } {
+            informme error "Must specify at least 1 command to execute."
+            exp_exit 1
+        } else {
+            lappend commands $tmp
+        }
+    } else {
+        while 1 {
+            if { [ gets $commandfile ln ] == -1 } { break }
+            lappend commands "$ln"
+        }
+        close $commandfile
+    }
+
+### specify a known default prompt regex to speed things up
+
+    if { $ask_for_myprompt == "yes" } {
+
+        if { $check_for_myprompt_regexp == "yes" } {
+            if { [ info exists env(MY_PROMPT_REGEXP) ] } {
+                set prompt_myprompt_re "$env(MY_PROMPT_REGEXP)"
+            }
+        } else {
+            set prompt_myprompt_re [ askme "Regex matching your usual shell prompt" echo ]
+        }
+
+        if { [ llength $prompt_myprompt_re ] > 0 } {
+            send_user "I will look for regex ->$prompt_myprompt_re<- when I login to each system.\n"
+        } else {
+            send_user "I will not look for a regex that is a null string.\n"
+            set prompt_myprompt_re $default_myprompt_re
+        }
+    }
+
+#####
+# 3. MAIN LOOP
+#####
+
+    informme banner1 "DOFOREACH BEGIN LOOP"
+
+### Open int host session
+
+    set inthost_spawnpid ""
+    if { $inthost != "" } {
+
+        verboseme 1 "Spawning connection to jumphost"
+        catch { spawn ssh -e^ -q -o "StrictHostKeyChecking=no" -l $intid $inthost } err
+        set inthost_spawnpid $spawn_id
+        debugme 1 "Connection $inthost_spawnpid created $err"
+
+        debugme 1 "Calling send_start_session prompt=//$prompt_inthost//  timeout=$start_tmo"
+        set rv [ send_start_session $prompt_inthost "" $start_tmo $mypw ]
+        debugme 2 "send_start_session returned status $rv"
+
+        if { $rv != 0 } {
+            informme error "Host connection $inthost_spawnpid open failed, $rv"
+        }
+    }
+
+
+### For each host
+
+    for { set h 0 } { $h < [ llength $hosts ] } { incr h } {
+
+        set curh [ lindex $hosts $h ]
+
+        informme banner1 "FOR HOST $curh"
+        informme line "--- $hostfn $commandfn $rtitle"
+
+### Connect to target host
+
+        set host_spawnpid ""
+
+        if { $inthost == "" } {
+
+            verboseme 1 "Spawning connection to host"
+            catch { spawn ssh -q -o "StrictHostKeyChecking=no" -l $myid $curh } err
+            set host_spawnpid $spawn_id
+            informme 1 "Connection $host_spawnpid created $err"
+
+            debugme 1 "Calling send_start_session prompt=//$prompt_remhost//  timeout=$start_tmo"
+            set rv [ send_start_session $prompt_remhost "" $start_tmo $mypw ]
+            debugme 2 "send_start_session returned status $rv"
+
+        } else {
+
+            debugme 1 "Are we still talking to $inthost ?"
+            set rv [ send_cmd $prompt_inthost $tmo "ACK" "echo" ]
+            if { $rv != 0 } { debugme 1 "Not talking to $inthost, sts: $rv" }
+
+            verboseme 1 "Connecting from $inthost $spawn_id to $myid at $curh via ssh"
+
+            set cmd "ssh -q -o \"StrictHostKeyChecking=no\" -l $myid $curh"
+            send $cmd
+            send "\r"
+
+            set rv [ send_start_session $prompt_remhost $prompt_inthost $start_tmo $mypw ]
+            debugme 2 "send_start_session returned status $rv"
+
+        }
+
+### Execute commands
+
+        if { $rv != 0 } {
+            informme error "Failed to connect to $curh, skipping"
+        } else {
+            for { set c 0 } { $c < [ llength $commands ] } { incr c } {
+                debugme 3 "send_cmd getting cmd $c"
+                set cmd [ lindex $commands $c ]
+                debugme 3 "send_cmd cmd $cmd"
+                regsub " .*$" $cmd "" tmp
+
+# regsub preferred to lindex in case command contains embedded double quotes
+# lindex should be ok with dfepush
+
+                debugme 3 "send_cmd regsub $tmp"
+#                set tmp [ lindex $cmd 0 ]
+#                debugme 3 "send_cmd lindex cmd 0 $tmp"
+                if {  $tmp == "dfepush" } {
+                    set dfefn [ lindex $cmd 1 ]
+                    set dferemfn [ lindex $cmd 2 ]
+                    if { $dferemfn == "" } { set dferemfn $dfefn }
+                    informme banner2begin "DFEPUSH: local $dfefn to remote $dferemfn"
+                    set rv [ dfepush $prompt_remhost $tmo $dfefn $dferemfn ]
+                } else {
+                    informme banner2begin "COMMAND: $cmd"
+                    set rv [ send_cmd $prompt_remhost $tmo $mypw $cmd ]
+                }
+
+                if { $rv != 0 } {
+                    debugme 2 "send_cmd returned status $rv"
+                    break
+                }
+            }
+            informme banner2end "END OF COMMANDS"
+        }
+
+### Close session
+
+        if { $inthost == "" } {
+            if { $rv == 0 } {
+                set rv [ send_cmd $prompt_remhost $tmo $mypw "exit" ]
+            }
+
+# Zombie repellent
+
+            wait -nowait
+#            if [ catch { close -i "$host_spawnpid" } tmp ] {
+#            informme error "Host connection $host_spawnpid close failed, $tmp"
+#            } else {
+                informme info "Host connection $host_spawnpid closed"
+                set host_spawnpid ""
+#            }
+        } else {
+            if { $rv == 0 } {
+                informme info "Closing remote session on int host"
+                set rv [ send_cmd $prompt_inthost $tmo $mypw "exit" ]
+            } else {
+                informme info "Closing failed remote session on int host"
+
+                set rv [ send_cmd $prompt_inthost $echo_tmo  $mypw "echo" ]
+
+                if { $rv != 0 } {
+                    set rv [ send_cmd $prompt_inthost $tmo  $mypw "\r~.\n~.\r~.\n~." ]
+                }
+
+                if { $rv != 0 } {
+                    set rv [ send_cmd $prompt_inthost $tmo  $mypw "\003" ]
+                }
+
+                if { $rv != 0 } {
+                    set rv [ send_cmd $prompt_inthost $tmo  $mypw "\032" ]
+                    set rv [ send_cmd $prompt_inthost $tmo $mypw "\032\032\n\nkill -9 %1" ]
+                }
+
+            }
+
+            if { $rv != 0 } {
+                informme info "Escape failed $rv on int host"
+                set rv [ send_cmd $prompt_inthost $echo_tmo  $mypw "echo" ]
+                }
+            if { $rv != 0 } {
+                informme info "Echo failed $rv on int host"
+                set rv [ send_cmd $prompt_inthost "5"  $mypw "exit" ]
+                set rv [ send_cmd $prompt_inthost $tmo $mypw "\003\003" ]
+            }
+        }
+    }
+
+### Close int host session
+
+    if { $inthost != "" } {
+        set rv [ send_cmd $prompt_inthost $tmo $mypw "exit" ]
+
+# Zombie repellent
+
+        wait -nowait
+        if [ catch { close -i "$inthost_spawnpid" } tmp ] {
+            informme error "Intermediate host connection $inthost_spawnpid close failed, $tmp"
+
+        } else {
+            debugme 1 "Inthost connection $inthost_spawnpid closed"
+            set inthost_spawnpid ""
+            if [ catch { close -i "$inthost_spawnpid" } tmp ] {
+                    informme error "Intermediate host connection $inthost_spawnpid close failed, $tmp"
+
+            } else {
+                debugme 1 "Inthost connection $inthost_spawnpid closed"
+                set inthost_spawnpid ""
+            }
+        }
+    }
+
+###
+# 4. END
+###
+    informme banner1 "DOFOREACH END RUN"
+
+
+
